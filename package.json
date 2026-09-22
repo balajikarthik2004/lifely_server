@@ -1,7 +1,7 @@
 {
   "name": "lifely-server",
   "version": "1.0.0",
-  "description": "Lifely API \u2014 Node, Express, MongoDB Atlas",
+  "description": "Lifely API — Node, Express, MongoDB Atlas",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -20,6 +20,7 @@
   "type": "commonjs",
   "private": true,
   "dependencies": {
+    "@google/genai": "^2.24.0",
     "bcryptjs": "^3.0.3",
     "compression": "^1.8.2",
     "cors": "^2.8.6",

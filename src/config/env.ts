@@ -24,6 +24,8 @@ const schema = z.object({
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(20),
 
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
+
+  GEMINI_API_KEY: z.string().optional(),
 });
 
 export type Env = z.infer<typeof schema> & { corsOrigins: string[] | true };

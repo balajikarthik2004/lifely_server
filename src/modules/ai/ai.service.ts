@@ -9,6 +9,8 @@
  * Guardrails: every sentence below is derived from recorded data. Where data is
  * missing, the assistant says so rather than inventing an activity.
  */
+import { GoogleGenAI, Type } from '@google/genai';
+import { env } from '@/config/env';
 import { lastNDayKeys, todayKey } from '@/common/utils/dates';
 import { toObjectId } from '@/common/utils/ownership';
 import { currentStreak, type HabitLike } from '@/domain/habits';
@@ -123,204 +125,76 @@ export async function buildContext(userId: string): Promise<AIContext> {
   };
 }
 
-function formatDuration(minutes: number): string {
-  if (minutes <= 0) return '0m';
-  const h = Math.floor(minutes / 60);
-  const m = Math.round(minutes % 60);
-  if (h === 0) return `${m}m`;
-  if (m === 0) return `${h}h`;
-  return `${h}h ${m}m`;
-}
 
-function addHours(time: string, hours: number): string {
-  const [h, m] = time.split(':').map(Number);
-  return `${String((h + hours) % 24).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-}
+class GeminiAnalyst implements AIProvider {
+  private async askGemini(prompt: string, ctx: AIContext): Promise<AIReply> {
+    if (!env.GEMINI_API_KEY) {
+      return {
+        text: 'I am not configured yet. Please add your GEMINI_API_KEY to the server configuration.',
+        suggestions: ['How to add API key?'],
+        basedOn: [],
+      };
+    }
+    
+    const gemini = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
+    const replySchema = {
+      type: Type.OBJECT,
+      properties: {
+        text: { type: Type.STRING },
+        suggestions: { type: Type.ARRAY, items: { type: Type.STRING } },
+        basedOn: { type: Type.ARRAY, items: { type: Type.STRING } },
+      },
+      required: ['text', 'basedOn'],
+    };
 
-class LocalAnalyst implements AIProvider {
+    const contextString = JSON.stringify(ctx, null, 2);
+    const systemInstruction = `You are a personalized productivity assistant for the Lifely app. Answer the user's query concisely and directly, using ONLY the provided JSON context about their day, week, goals, habits, and tasks. Never invent data. Keep responses under 3 sentences unless asked otherwise. Return JSON exactly matching the requested schema.`;
+    
+    try {
+      const response = await gemini.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [
+          { role: 'user', parts: [{ text: `Context:\n${contextString}\n\nQuery:\n${prompt}` }] }
+        ],
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: replySchema,
+        }
+      });
+
+      const replyJson = response.text;
+      if (!replyJson) throw new Error('Empty response from Gemini');
+      
+      const parsed = JSON.parse(replyJson);
+      return parsed as AIReply;
+    } catch (e) {
+      console.error('Failed to parse or fetch Gemini response', e);
+      return { text: 'I encountered an error understanding my own response or reaching the AI service.', basedOn: [] };
+    }
+  }
+
   async summarizeDay(ctx: AIContext): Promise<AIReply> {
-    const { today } = ctx;
-    const nothingYet =
-      today.tasksCompleted === 0 && today.habitsCompleted === 0 && today.creditsEarned === 0;
-
-    if (nothingYet) {
-      return {
-        text: 'Nothing is logged for today yet, so there is nothing for me to read into. Log one activity or tick off a habit and I will have something to work with.',
-        suggestions: ['Plan tomorrow for me', 'How are my habits doing?'],
-        basedOn: ["today's record"],
-      };
-    }
-
-    const pastDays = ctx.week.filter((r) => r.date <= todayKey());
-    const avgScore = pastDays.reduce((sum, r) => sum + r.lifeScore, 0) / (pastDays.length || 1);
-    const delta = today.lifeScore - avgScore;
-    const comparison =
-      avgScore > 0
-        ? delta >= 0
-          ? ` That puts you ${Math.round(delta)} points above your week so far.`
-          : ` That is ${Math.round(-delta)} points below your week so far — there is still time.`
-        : '';
-
-    return {
-      text: `You completed ${today.tasksCompleted} of ${today.tasksTotal || today.tasksCompleted} tasks, kept ${today.habitsCompleted} of ${today.habitsTotal} habits, and spent ${formatDuration(today.focusMinutes)} in focused work, earning ${today.creditsEarned} credits. Your Life Score is ${today.lifeScore}.${comparison}`,
-      suggestions: ['Where did I lose time?', 'Plan tomorrow for me'],
-      basedOn: ['tasks', 'habits', 'activities', 'credit ledger'],
-    };
+    return this.askGemini("Summarize my day, highlight any specific achievements or areas where I missed things.", ctx);
   }
-
   async analyzeProductivity(ctx: AIContext): Promise<AIReply> {
-    const entries = Object.entries(ctx.minutesByCategory)
-      .filter(([, minutes]) => minutes > 0)
-      .sort((a, b) => b[1] - a[1]);
-
-    if (entries.length === 0) {
-      return {
-        text: 'Your timeline is empty for today, so I cannot tell where the time went. Adding even three or four entries makes this much more useful.',
-        suggestions: ['Summarize my day'],
-        basedOn: ['timeline'],
-      };
-    }
-
-    const [topCategory, topMinutes] = entries[0];
-    const gapLine =
-      ctx.untrackedMinutes >= 45
-        ? ` You also have ${formatDuration(ctx.untrackedMinutes)} of untracked time today — I cannot say what happened there, only that nothing was logged.`
-        : ' Almost all of your day is accounted for, which is unusual and good.';
-
-    return {
-      text: `Your biggest block today was ${topCategory.toLowerCase()} at ${formatDuration(topMinutes)}. Focused sessions came to ${formatDuration(ctx.today.focusMinutes)}.${gapLine}`,
-      suggestions: ['Plan tomorrow for me', 'Am I moving toward my goals?'],
-      basedOn: ['timeline', 'focus sessions'],
-    };
+    return this.askGemini("Where did I lose time? Analyze my productivity and timeline.", ctx);
   }
-
   async planTomorrow(ctx: AIContext): Promise<AIReply> {
-    const rank: Record<string, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
-    const open = [...ctx.openTasks].sort((a, b) => rank[a.priority] - rank[b.priority]);
-    const start = ctx.profile.workStart;
-
-    const lines = [`${start}–${addHours(start, 2)}  Deep work`];
-    if (open[0]) lines.push(`   → ${open[0].title}`);
-    lines.push(`${addHours(start, 2)}–${addHours(start, 3)}  Shallow work, messages, reviews`);
-    if (open[1]) lines.push(`   → ${open[1].title}`);
-    lines.push('13:00–14:00  Lunch, away from the screen');
-    lines.push(`14:00–${addHours(start, 7)}  Second focus block`);
-    if (open[2]) lines.push(`   → ${open[2].title}`);
-
-    const healthHabit = ctx.habits.find((h) => h.category === 'HEALTH');
-    if (healthHabit) lines.push(`18:00–19:00  ${healthHabit.name}`);
-    lines.push('21:30  Reflection, then lights out');
-
-    const basis = open.length
-      ? `Built from your ${open.length} open ${open.length === 1 ? 'task' : 'tasks'} and your usual hours.`
-      : 'You have no open tasks, so this is just your usual shape of day.';
-
-    return {
-      text: `${basis}\n\n${lines.join('\n')}\n\nThe first block is the one worth defending.`,
-      suggestions: ['Summarize my day', 'How are my habits doing?'],
-      basedOn: ['open tasks', 'habits', 'preferred hours'],
-    };
+    return this.askGemini("Plan tomorrow for me based on my open tasks, work hours, and habits.", ctx);
   }
-
   async analyzeHabits(ctx: AIContext): Promise<AIReply> {
-    if (ctx.habits.length === 0) {
-      return {
-        text: 'You have not set up any habits yet. Two or three is plenty to start — more than that and they tend to collapse together.',
-        suggestions: ['Plan tomorrow for me'],
-        basedOn: ['habits'],
-      };
-    }
-
-    const ranked = [...ctx.habits].sort((a, b) => b.streak - a.streak);
-    const best = ranked[0];
-    const weakest = ranked[ranked.length - 1];
-
-    const bestLine =
-      best.streak > 0
-        ? `${best.name} is your strongest right now at ${best.streak} ${best.streak === 1 ? 'day' : 'days'}.`
-        : 'No habit has a live streak today.';
-
-    const weakLine =
-      ranked.length > 1 && weakest.streak === 0
-        ? ` ${weakest.name} is the one slipping — it has no current streak.`
-        : '';
-
-    return {
-      text: `${bestLine}${weakLine} Across today you have kept ${ctx.today.habitsCompleted} of ${ctx.today.habitsTotal} scheduled habits.`,
-      suggestions: ['Summarize my day', 'Am I moving toward my goals?'],
-      basedOn: ['habit logs'],
-    };
+    return this.askGemini("How are my habits doing? Identify my strongest and weakest ones.", ctx);
   }
-
   async analyzeGoals(ctx: AIContext): Promise<AIReply> {
-    if (ctx.goals.length === 0) {
-      return {
-        text: 'There are no active goals to measure against. A goal gives the daily work somewhere to point.',
-        suggestions: ['Plan tomorrow for me'],
-        basedOn: ['goals'],
-      };
-    }
-
-    const scored = [...ctx.goals].sort((a, b) => b.progress - a.progress);
-    const lead = scored[0];
-    const lag = scored[scored.length - 1];
-    const deadlineNote = lag.deadline ? ` Its deadline is ${lag.deadline}.` : '';
-
-    if (scored.length === 1) {
-      return {
-        text: `${lead.title} is at ${Math.round(lead.progress)}%.${deadlineNote}`,
-        suggestions: ['Plan tomorrow for me'],
-        basedOn: ['goals'],
-      };
-    }
-
-    return {
-      text: `${lead.title} is furthest along at ${Math.round(lead.progress)}%. ${lag.title} is the one lagging at ${Math.round(lag.progress)}%.${deadlineNote} I can only see what has been logged — if you have made progress off-app, update it and this will sharpen.`,
-      suggestions: ['How are my habits doing?', 'Summarize my day'],
-      basedOn: ['goals', 'milestones'],
-    };
+    return this.askGemini("Am I moving toward my goals? Break down the progress.", ctx);
   }
-
   async chat(message: string, ctx: AIContext): Promise<AIReply> {
-    const q = message.toLowerCase();
-
-    if (/(summar|how was|my day|today)/.test(q)) return this.summarizeDay(ctx);
-    if (/(waste|lose time|lost time|where did|time go|untracked)/.test(q)) {
-      return this.analyzeProductivity(ctx);
-    }
-    if (/(plan|tomorrow|schedule)/.test(q)) return this.planTomorrow(ctx);
-    if (/(habit|streak|routine)/.test(q)) return this.analyzeHabits(ctx);
-    if (/(goal|progress|milestone)/.test(q)) return this.analyzeGoals(ctx);
-
-    if (/(credit|balance|reward)/.test(q)) {
-      return {
-        text: `You are holding ${ctx.balance.toLocaleString('en-US')} credits, and earned ${ctx.today.creditsEarned} of them today.`,
-        suggestions: ['Summarize my day'],
-        basedOn: ['credit ledger'],
-      };
-    }
-
-    if (/(tip|advice|help me|improve|better)/.test(q)) {
-      const weakest = [...ctx.week]
-        .filter((r) => r.date <= todayKey())
-        .sort((a, b) => a.lifeScore - b.lifeScore)[0];
-      const dayNote = weakest ? ` Your weakest day this week was ${weakest.date}.` : '';
-      return {
-        text: `One thing that reliably moves the number: protect a single two-hour block tomorrow morning and put your hardest task in it.${dayNote}`,
-        suggestions: ['Plan tomorrow for me'],
-        basedOn: ['weekly records'],
-      };
-    }
-
-    return {
-      text: 'I work from what you have logged here — your day, habits, goals, credits and reflections. Ask me about any of those and I will answer from the actual record rather than guessing.',
-      suggestions: AI_QUICK_ACTIONS,
-      basedOn: [],
-    };
+    return this.askGemini(message, ctx);
   }
 }
 
-export const aiProvider: AIProvider = new LocalAnalyst();
+export const aiProvider: AIProvider = new GeminiAnalyst();
 
 /** Recent days available to the assistant, stated so the client can show it. */
 export function contextWindowDays(): number {
